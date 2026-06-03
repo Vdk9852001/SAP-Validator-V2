@@ -1,592 +1,334 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SAP Migration Validator</title>
-<style>
-  *, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
-  :root {
-    --bg:#0f1117; --surface:#1a1d27; --surface2:#222536;
-    --border:#2e3248; --text:#e2e4f0; --muted:#7c82a0;
-    --pass:#22c55e; --fail:#ef4444; --warn:#f59e0b;
-    --info:#3b82f6; --accent:#6366f1;
-  }
-  body { font-family:'Segoe UI',system-ui,sans-serif;
-         background:var(--bg); color:var(--text); min-height:100vh; }
+"""
+SAP Migration Post-Load Validator - Live Dashboard
+Run:  python dashboard/app.py
+Open: http://localhost:5000
 
-  header { background:var(--surface); border-bottom:1px solid var(--border);
-           padding:0 28px; display:flex; align-items:center;
-           justify-content:space-between; height:56px; }
-  .logo  { font-size:15px; font-weight:600; display:flex; align-items:center; gap:10px; }
-  .logo span { color:var(--accent); }
-  .header-right { display:flex; align-items:center; gap:10px; }
-  .hbtn { border:none; padding:7px 16px; border-radius:6px; font-size:13px;
-          cursor:pointer; font-weight:500; transition:opacity .2s; }
-  #scan-btn    { background:var(--accent); color:#fff; }
-  #reports-btn { background:var(--surface2); color:var(--text); border:1px solid var(--border); }
-  #log-btn     { background:var(--surface2); color:var(--text); border:1px solid var(--border); }
-  .hbtn:hover    { opacity:.85; }
-  .hbtn:disabled { opacity:.4; cursor:default; }
-  .last-scan { font-size:12px; color:var(--muted); }
+Drop source files into: data/source/
+Drop target files into: data/target/
+Files matched by name: MATERIAL.csv <-> MATERIAL.csv
+Excel reports saved to: reports/<TABLE>_<timestamp>.xlsx
+"""
 
-  .layout { display:grid; grid-template-columns:280px 1fr;
-            height:calc(100vh - 56px); }
+import sys
+import threading
+import time
+from pathlib import Path
+from datetime import datetime
+from flask import Flask, render_template, jsonify, send_file
 
-  aside { background:var(--surface); border-right:1px solid var(--border);
-          display:flex; flex-direction:column; overflow:hidden; }
-  .sidebar-head { padding:16px 18px 10px; font-size:11px; font-weight:600;
-                  color:var(--muted); letter-spacing:.06em; text-transform:uppercase; }
-  #table-list { flex:1; overflow-y:auto; }
-  .table-item { display:flex; align-items:center; justify-content:space-between;
-                padding:10px 18px; cursor:pointer; border-left:3px solid transparent;
-                transition:background .15s; font-size:13px; gap:8px; }
-  .table-item:hover  { background:var(--surface2); }
-  .table-item.active { background:var(--surface2); border-left-color:var(--accent); }
-  .tname { font-weight:500; flex:1; min-width:0;
-           white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from core.validator import MaterialValidator
+from core.reporter import generate_excel_report
 
-  .state-pill { font-size:10px; font-weight:700; padding:2px 7px;
-                border-radius:10px; flex-shrink:0; white-space:nowrap; }
-  .state-new        { background:rgba(59,130,246,.2);  color:#60a5fa; }
-  .state-changed    { background:rgba(245,158,11,.2);  color:var(--warn); }
-  .state-validating { background:rgba(99,102,241,.2);  color:#a5b4fc;
-                      animation:blink .8s ease-in-out infinite; }
-  .state-done-pass  { background:rgba(34,197,94,.15);  color:var(--pass); }
-  .state-done-fail  { background:rgba(239,68,68,.15);  color:var(--fail); }
-  .state-error      { background:rgba(239,68,68,.15);  color:var(--fail); }
-  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.4} }
+app = Flask(__name__)
 
-  .unmatched-item { padding:8px 18px; font-size:12px; color:var(--warn);
-                    display:flex; align-items:center; gap:6px; }
+BASE_DIR    = Path(__file__).parent.parent
+SOURCE_DIR  = BASE_DIR / "data" / "source"
+TARGET_DIR  = BASE_DIR / "data" / "target"
+REPORTS_DIR = BASE_DIR / "reports"
+SOURCE_DIR.mkdir(parents=True, exist_ok=True)
+TARGET_DIR.mkdir(parents=True, exist_ok=True)
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-  main { overflow-y:auto; padding:28px; }
+results_store = {}
+scan_status   = {"last_scan": None, "scanning": False, "error": None}
+file_states   = {}   # name -> {state, detected_at, source_file, target_file}
+activity_log  = []   # last 50 events
+SUPPORTED_EXT = {".csv", ".xlsx", ".xls"}
 
-  #welcome { display:flex; flex-direction:column; align-items:center;
-             justify-content:center; height:100%; gap:16px; text-align:center; }
-  #welcome h2 { font-size:22px; font-weight:500; }
-  #welcome p  { color:var(--muted); font-size:14px; max-width:480px; line-height:1.6; }
-  .folder-box { background:var(--surface); border:1px solid var(--border);
-                border-radius:10px; padding:18px 28px; text-align:left;
-                font-size:13px; line-height:2.2; min-width:360px; }
-  .folder-box b { color:var(--accent); }
 
-  #detail { display:none; }
-  .detail-header { display:flex; align-items:flex-start;
-                   justify-content:space-between; margin-bottom:24px; gap:16px; }
-  .detail-title { font-size:20px; font-weight:600; }
-  .detail-meta  { font-size:12px; color:var(--muted); margin-top:4px; }
-  .detail-actions { display:flex; align-items:center; gap:10px; flex-shrink:0; }
-  .status-pill { font-size:13px; font-weight:700; padding:6px 18px; border-radius:20px; }
-  .pill-pass { background:rgba(34,197,94,.15); color:var(--pass); }
-  .pill-fail { background:rgba(239,68,68,.15);  color:var(--fail); }
-  .pill-err  { background:rgba(245,158,11,.15); color:var(--warn); }
-  .dl-btn { background:rgba(99,102,241,.15); color:#a5b4fc;
-            border:1px solid rgba(99,102,241,.3); padding:6px 16px; border-radius:6px;
-            font-size:13px; font-weight:600; cursor:pointer; text-decoration:none;
-            display:inline-flex; align-items:center; gap:6px; transition:background .2s; }
-  .dl-btn:hover { background:rgba(99,102,241,.25); }
-  .dl-btn.disabled { opacity:.4; cursor:default; pointer-events:none; }
-
-  .state-banner { display:flex; align-items:center; gap:12px; padding:12px 16px;
-                  border-radius:8px; margin-bottom:20px; font-size:13px; }
-  .state-banner.validating { background:rgba(99,102,241,.12);
-                              border:1px solid rgba(99,102,241,.25); color:#a5b4fc; }
-  .state-banner.new        { background:rgba(59,130,246,.1);
-                              border:1px solid rgba(59,130,246,.25); color:#60a5fa; }
-  .state-banner.changed    { background:rgba(245,158,11,.1);
-                              border:1px solid rgba(245,158,11,.25); color:var(--warn); }
-
-  .spinner { width:14px; height:14px; border:2px solid currentColor;
-             border-top-color:transparent; border-radius:50%;
-             animation:spin .7s linear infinite; flex-shrink:0; }
-  @keyframes spin { to { transform:rotate(360deg); } }
-
-  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
-           gap:12px; margin-bottom:24px; }
-  .card  { background:var(--surface); border:1px solid var(--border);
-           border-radius:10px; padding:16px 18px; }
-  .card .num { font-size:26px; font-weight:700; }
-  .card .lbl { font-size:11px; color:var(--muted); margin-top:4px; }
-  .card.warn .num { color:var(--fail); }
-  .card.ok   .num { color:var(--pass); }
-
-  .section-title { font-size:13px; font-weight:600; color:var(--muted);
-                   text-transform:uppercase; letter-spacing:.06em; margin:24px 0 12px; }
-
-  .tbl-wrap { border:1px solid var(--border); border-radius:10px;
-              overflow:hidden; margin-bottom:28px; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th { background:var(--surface2); color:var(--muted); font-size:11px;
-       font-weight:600; text-transform:uppercase; letter-spacing:.05em;
-       padding:10px 14px; text-align:left; }
-  td { padding:9px 14px; border-top:1px solid var(--border); }
-  tr:hover td { background:var(--surface2); }
-  .type-num { color:var(--info);  font-size:11px; font-weight:600; }
-  .type-str { color:var(--muted); font-size:11px; }
-  .pct-bar-wrap { display:flex; align-items:center; gap:8px; }
-  .pct-bar  { height:6px; border-radius:3px; background:var(--border); flex:1; }
-  .pct-fill { height:100%; border-radius:3px; background:var(--pass); transition:width .4s; }
-  .pct-fill.low { background:var(--fail); }
-  .pct-fill.mid { background:var(--warn); }
-  .pct-val  { font-size:12px; font-weight:600; min-width:40px; text-align:right; }
-
-  .row-expander { cursor:pointer; }
-  .row-expander:hover td { background:rgba(99,102,241,.07); }
-  .expand-icon { color:var(--muted); font-size:11px; transition:transform .2s; }
-  .expand-icon.open { transform:rotate(90deg); }
-  .mismatch-detail    { display:none; }
-  .mismatch-detail td { padding:0; }
-  .mismatch-inner { padding:12px 14px 16px 32px; }
-  .mismatch-inner table { border:1px solid var(--border); border-radius:6px;
-                           overflow:hidden; font-size:12px; }
-  .mismatch-inner td { background:var(--bg); }
-  .diff-old { color:var(--fail); }
-  .diff-new { color:var(--pass); }
-
-  .mapping-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:24px; }
-  .map-box    { background:var(--surface); border:1px solid var(--border);
-                border-radius:8px; padding:14px 16px; }
-  .map-box h4 { font-size:11px; font-weight:600; color:var(--muted);
-                text-transform:uppercase; letter-spacing:.06em; margin-bottom:10px; }
-  .map-tag         { display:inline-block; background:var(--surface2); color:var(--text);
-                     font-size:11px; padding:3px 8px; border-radius:4px;
-                     margin:2px; border:1px solid var(--border); }
-  .map-tag.numeric { border-color:var(--info); color:var(--info); }
-  .map-tag.warn    { border-color:var(--warn); color:var(--warn); }
-
-  .error-box { background:rgba(239,68,68,.1); border:1px solid rgba(239,68,68,.3);
-               border-radius:8px; padding:14px 18px; color:var(--fail);
-               font-size:13px; margin-bottom:20px; }
-
-  #toast-container { position:fixed; bottom:24px; right:24px;
-                     display:flex; flex-direction:column-reverse; gap:8px; z-index:200; }
-  .toast { background:var(--surface); border:1px solid var(--border);
-           border-radius:8px; padding:12px 18px; font-size:13px; max-width:340px;
-           box-shadow:0 4px 16px rgba(0,0,0,.4);
-           display:flex; align-items:flex-start; gap:10px;
-           animation:slideIn .25s ease; }
-  .toast.removing { animation:slideOut .25s ease forwards; }
-  .toast-icon { font-size:16px; flex-shrink:0; margin-top:1px; }
-  .toast-msg  { flex:1; line-height:1.45; }
-  .toast.info    { border-left:3px solid var(--info); }
-  .toast.success { border-left:3px solid var(--pass); }
-  .toast.warn    { border-left:3px solid var(--warn); }
-  .toast.error   { border-left:3px solid var(--fail); }
-  @keyframes slideIn  { from{opacity:0;transform:translateX(20px)} to{opacity:1;transform:none} }
-  @keyframes slideOut { to{opacity:0;transform:translateX(20px)} }
-
-  .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,.6);
-                   display:none; align-items:center; justify-content:center; z-index:100; }
-  .modal-overlay.open { display:flex; }
-  .modal { background:var(--surface); border:1px solid var(--border);
-           border-radius:12px; width:640px; max-height:80vh;
-           display:flex; flex-direction:column; overflow:hidden; }
-  .modal-head { padding:18px 20px; border-bottom:1px solid var(--border);
-                display:flex; align-items:center; justify-content:space-between; }
-  .modal-head h3 { font-size:15px; font-weight:600; }
-  .modal-close { background:none; border:none; color:var(--muted);
-                 font-size:20px; cursor:pointer; }
-  .modal-close:hover { color:var(--text); }
-  .modal-body { overflow-y:auto; padding:16px 20px; }
-
-  .log-entry { display:flex; align-items:baseline; gap:10px; padding:7px 10px;
-               border-radius:6px; font-size:12px; margin-bottom:4px;
-               border-left:3px solid transparent; }
-  .log-entry.info    { border-color:var(--info);  background:rgba(59,130,246,.05); }
-  .log-entry.success { border-color:var(--pass);  background:rgba(34,197,94,.05); }
-  .log-entry.warn    { border-color:var(--warn);  background:rgba(245,158,11,.05); }
-  .log-entry.error   { border-color:var(--fail);  background:rgba(239,68,68,.05); }
-  .log-ts  { color:var(--muted); flex-shrink:0; font-family:monospace; font-size:11px; }
-  .log-msg { flex:1; line-height:1.45; }
-  .log-icon { flex-shrink:0; }
-
-  .report-row { display:flex; align-items:center; justify-content:space-between;
-                padding:10px 12px; border-radius:8px; margin-bottom:6px;
-                background:var(--surface2); font-size:13px; gap:12px; }
-  .report-name { font-weight:500; flex:1; min-width:0;
-                 white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .report-meta { font-size:11px; color:var(--muted); white-space:nowrap; }
-  .report-dl { background:rgba(99,102,241,.15); color:#a5b4fc;
-               border:1px solid rgba(99,102,241,.3); padding:4px 12px;
-               border-radius:5px; font-size:12px; font-weight:600;
-               text-decoration:none; }
-  .report-dl:hover { background:rgba(99,102,241,.25); }
-  .empty-msg { color:var(--muted); font-size:14px; text-align:center; padding:32px; }
-
-  .scanning-dot { width:8px; height:8px; border-radius:50%; background:var(--accent);
-                  display:inline-block; animation:pulse 1s ease-in-out infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
-
-  ::-webkit-scrollbar       { width:6px; }
-  ::-webkit-scrollbar-track { background:transparent; }
-  ::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
-</style>
-</head>
-<body>
-
-<header>
-  <div class="logo">&#x2B21; <span>SAP</span> Migration Validator</div>
-  <div class="header-right">
-    <span id="scan-indicator" style="display:none"><span class="scanning-dot"></span></span>
-    <span class="last-scan" id="last-scan-label">Not scanned yet</span>
-    <button class="hbtn" id="log-btn"     onclick="openLog()">&#128221; Activity Log</button>
-    <button class="hbtn" id="reports-btn" onclick="openReports()">&#128196; Excel Reports</button>
-    <button class="hbtn" id="scan-btn"    onclick="triggerScan()">&#8635; Scan Now</button>
-  </div>
-</header>
-
-<div class="layout">
-  <aside>
-    <div class="sidebar-head">Tables</div>
-    <div id="table-list"></div>
-  </aside>
-  <main>
-    <div id="welcome">
-      <h2>Post-Load Validation Dashboard</h2>
-      <p>Drop your source and target CSV or XLSX files into the folders below.
-         New files are detected within 5 seconds, validated automatically,
-         and a toast notification confirms completion.</p>
-      <div class="folder-box" id="folder-paths">
-        <div>&#128194; Source &#8594; <b>data/source/</b></div>
-        <div>&#128194; Target &#8594; <b>data/target/</b></div>
-        <div>&#128196; Reports &#8594; <b>reports/</b></div>
-        <div style="margin-top:10px;color:#7c82a0;font-size:12px">
-          Files matched by name &mdash; MATERIAL.csv &#8596; MATERIAL.csv
-        </div>
-      </div>
-    </div>
-    <div id="detail"></div>
-  </main>
-</div>
-
-<div id="toast-container"></div>
-
-<div class="modal-overlay" id="log-modal">
-  <div class="modal">
-    <div class="modal-head">
-      <h3>&#128221; Activity Log</h3>
-      <button class="modal-close" onclick="closeLog()">&times;</button>
-    </div>
-    <div class="modal-body" id="log-list">
-      <div class="empty-msg">No activity yet.</div>
-    </div>
-  </div>
-</div>
-
-<div class="modal-overlay" id="reports-modal">
-  <div class="modal">
-    <div class="modal-head">
-      <h3>&#128196; Excel Reports</h3>
-      <button class="modal-close" onclick="closeReports()">&times;</button>
-    </div>
-    <div class="modal-body" id="reports-list">
-      <div class="empty-msg">Loading&hellip;</div>
-    </div>
-  </div>
-</div>
-
-<script>
-let activeTable   = null;
-let allResults    = {};
-let allFileStates = {};
-let lastLogCount  = 0;
-
-const ICONS = { info:'&#8505;', success:'&#10003;', warn:'&#9888;', error:'&#10060;' };
-
-function showToast(msg, level) {
-  level = level || 'info';
-  const el = document.createElement('div');
-  el.className = 'toast ' + level;
-  el.innerHTML = '<span class="toast-icon">' + (ICONS[level]||'') + '</span>' +
-                 '<span class="toast-msg">' + esc(msg) + '</span>';
-  document.getElementById('toast-container').appendChild(el);
-  setTimeout(function() {
-    el.classList.add('removing');
-    setTimeout(function() { el.remove(); }, 260);
-  }, 5000);
-}
-
-async function init() {
-  const folders = await fetch('/api/folders').then(r => r.json());
-  document.getElementById('folder-paths').innerHTML =
-    '<div>&#128194; Source &rarr; <b>' + folders.source_dir + '</b></div>' +
-    '<div>&#128194; Target &rarr; <b>' + folders.target_dir + '</b></div>' +
-    '<div>&#128196; Reports &rarr; <b>' + folders.reports_dir + '</b></div>' +
-    '<div style="margin-top:10px;color:#7c82a0;font-size:12px">Files matched by name</div>';
-  await refresh();
-  setInterval(refresh, 4000);
-}
-
-async function refresh() {
-  const [status, results, activity] = await Promise.all([
-    fetch('/api/status').then(r => r.json()),
-    fetch('/api/results').then(r => r.json()),
-    fetch('/api/activity').then(r => r.json()),
-  ]);
-
-  document.getElementById('scan-indicator').style.display = status.scanning ? 'inline-block' : 'none';
-  document.getElementById('scan-btn').disabled = status.scanning;
-  if (status.last_scan)
-    document.getElementById('last-scan-label').textContent = 'Last scan: ' + status.last_scan;
-
-  // Show toasts for new log entries
-  const newEntries = activity.slice(0, activity.length - lastLogCount);
-  if (lastLogCount > 0) newEntries.forEach(function(e) { showToast(e.message, e.level); });
-  lastLogCount = activity.length;
-
-  allResults    = {};
-  allFileStates = status.file_states || {};
-  results.forEach(function(r) { allResults[r.name] = r; });
-
-  renderSidebar(status);
-
-  if (activeTable) {
-    const fs = allFileStates[activeTable];
-    if (fs && fs.state === 'validating') {
-      renderValidatingPlaceholder(activeTable, fs);
-    } else if (allResults[activeTable]) {
-      renderDetail(allResults[activeTable]);
+def log_event(message, level="info"):
+    entry = {
+        "ts":      datetime.now().strftime("%H:%M:%S"),
+        "message": message,
+        "level":   level,
     }
-  }
-}
+    activity_log.append(entry)
+    if len(activity_log) > 50:
+        activity_log.pop(0)
+    print(f"  [{entry['ts']}] {message}")
 
-async function triggerScan() {
-  await fetch('/api/scan', { method:'POST' });
-  setTimeout(refresh, 600);
-}
 
-function renderSidebar(status) {
-  const list = document.getElementById('table-list');
-  let html = '';
-  status.pairs.forEach(function(pair) {
-    const fs    = (status.file_states || {})[pair.name] || {};
-    const state = fs.state || '';
+# ── File discovery ────────────────────────────────────────────────────────────
+def discover_pairs():
+    src_files = {
+        f.stem.upper(): f
+        for f in SOURCE_DIR.iterdir()
+        if f.suffix.lower() in SUPPORTED_EXT
+    }
+    tgt_files = {
+        f.stem.upper(): f
+        for f in TARGET_DIR.iterdir()
+        if f.suffix.lower() in SUPPORTED_EXT
+    }
+    all_names = sorted(set(src_files) | set(tgt_files))
+    pairs = []
+    for name in all_names:
+        src_path = str(src_files[name]) if name in src_files else None
+        tgt_path = str(tgt_files[name]) if name in tgt_files else None
+        has_pair = name in src_files and name in tgt_files
+        mtime = None
+        if has_pair:
+            mtime = max(
+                Path(src_path).stat().st_mtime,
+                Path(tgt_path).stat().st_mtime
+            )
+        pairs.append({
+            "name":        name,
+            "source_path": src_path,
+            "target_path": tgt_path,
+            "has_pair":    has_pair,
+            "mtime":       mtime,
+            "source_file": Path(src_path).name if src_path else None,
+            "target_file": Path(tgt_path).name if tgt_path else None,
+        })
+    return pairs
 
-    if (!pair.has_pair) {
-      html += '<div class="unmatched-item">&#9888; ' + pair.name +
-        ' <span style="font-size:11px;color:#7c82a0">(' +
-        (pair.source_path ? 'no target' : 'no source') + ')</span></div>';
-      return;
+
+# ── Validation runner ─────────────────────────────────────────────────────────
+def run_validation(name, source_path, target_path):
+    validator = MaterialValidator()
+    result    = validator.validate(source_path, target_path)
+    ss        = result.summary_stats
+
+    field_rows = []
+    for fr in result.field_results:
+        field_rows.append({
+            "field":        fr.field_source,
+            "field_target": fr.field_target,
+            "type":         "numeric" if fr.is_numeric else "string",
+            "tolerance":    fr.tolerance_used,
+            "total":        fr.total_records,
+            "matched":      fr.matched,
+            "mismatched":   fr.mismatched,
+            "miss_source":  fr.missing_in_source,
+            "miss_target":  fr.missing_in_target,
+            "match_pct":    fr.match_pct,
+            "status":       fr.status,
+            "mismatches":   fr.mismatch_details[:50],
+        })
+
+    mapping = None
+    if result.mapping:
+        mapping = {
+            "join_key":           result.mapping.join_key,
+            "matched_fields":     result.mapping.matched_fields,
+            "source_only_fields": result.mapping.source_only_fields,
+            "target_only_fields": result.mapping.target_only_fields,
+            "numeric_fields":     result.mapping.numeric_fields,
+            "tolerance_map":      result.mapping.tolerance_map,
+        }
+
+    ts             = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_filename = f"{name}_{ts}.xlsx"
+    excel_path     = REPORTS_DIR / excel_filename
+
+    result_dict = {
+        "name":                   name,
+        "status":                 result.overall_status,
+        "source_file":            Path(source_path).name,
+        "target_file":            Path(target_path).name,
+        "total_source_records":   result.total_source_records,
+        "total_target_records":   result.total_target_records,
+        "records_matched":        result.records_matched,
+        "records_only_in_source": result.records_only_in_source,
+        "records_only_in_target": result.records_only_in_target,
+        "fields_passed":          ss["fields_passed"],
+        "fields_failed":          ss["fields_failed"],
+        "total_fields":           ss["total_fields_validated"],
+        "pass_rate_pct":          ss["pass_rate_pct"],
+        "errors":                 result.errors,
+        "mapping":                mapping,
+        "field_results":          field_rows,
+        "run_at":                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "excel_file":             excel_filename,
     }
 
-    let pill = '';
-    if      (state === 'validating') pill = '<span class="state-pill state-validating">Validating&hellip;</span>';
-    else if (state === 'new')        pill = '<span class="state-pill state-new">New</span>';
-    else if (state === 'changed')    pill = '<span class="state-pill state-changed">Changed</span>';
-    else if (state === 'error')      pill = '<span class="state-pill state-error">Error</span>';
-    else {
-      const r  = allResults[pair.name];
-      const st = r ? r.status : '';
-      if      (st === 'PASS')  pill = '<span class="state-pill state-done-pass">PASS</span>';
-      else if (st === 'FAIL')  pill = '<span class="state-pill state-done-fail">FAIL</span>';
-      else if (st === 'ERROR') pill = '<span class="state-pill state-error">ERROR</span>';
-      else                     pill = '<span class="state-pill state-new">&hellip;</span>';
-    }
+    try:
+        generate_excel_report(result_dict, str(excel_path))
+    except Exception as e:
+        result_dict["excel_error"] = str(e)
+        log_event(f"Excel generation failed for {name}: {e}", "error")
 
-    const act = activeTable === pair.name ? 'active' : '';
-    html += '<div class="table-item ' + act + '" onclick="selectTable(\'' + pair.name + '\', this)">' +
-            '<span class="tname">' + pair.name + '</span>' + pill + '</div>';
-  });
+    return result_dict
 
-  if (!html) html = '<div style="padding:20px 18px;font-size:13px;color:var(--muted)">No file pairs found.<br>Drop files into source/ and target/.</div>';
-  list.innerHTML = html;
-}
 
-function selectTable(name, el) {
-  activeTable = name;
-  document.querySelectorAll('.table-item').forEach(function(e) { e.classList.remove('active'); });
-  if (el) el.classList.add('active');
+def scan_and_validate_all():
+    scan_status["scanning"] = True
+    scan_status["error"]    = None
+    try:
+        pairs = discover_pairs()
 
-  const fs = allFileStates[name] || {};
-  if (fs.state === 'validating') { renderValidatingPlaceholder(name, fs); return; }
-  const r = allResults[name];
-  if (r) { renderDetail(r); return; }
+        for pair in pairs:
+            name = pair["name"]
 
-  document.getElementById('welcome').style.display = 'none';
-  document.getElementById('detail').style.display  = 'block';
-  document.getElementById('detail').innerHTML =
-    '<div class="state-banner new"><span class="spinner"></span>' +
-    '<span>&#128194; <b>' + name + '</b> — files detected, waiting for validation&hellip;</span></div>';
-}
+            if not pair["has_pair"]:
+                prev = file_states.get(name, {})
+                if prev.get("state") != "unmatched":
+                    side = "source" if pair["source_path"] else "target"
+                    other = "target" if side == "source" else "source"
+                    log_event(
+                        f"{name}: found in {side} only — waiting for matching {other} file",
+                        "warn"
+                    )
+                    file_states[name] = {
+                        "state":       "unmatched",
+                        "detected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "source_file": pair["source_file"],
+                        "target_file": pair["target_file"],
+                    }
+                continue
 
-function renderValidatingPlaceholder(name, fs) {
-  document.getElementById('welcome').style.display = 'none';
-  document.getElementById('detail').style.display  = 'block';
-  document.getElementById('detail').innerHTML =
-    '<div class="state-banner validating"><span class="spinner"></span>' +
-    '<span><b>' + name + '</b> is being validated now&hellip; ' +
-    (fs.source_file ? '(' + fs.source_file + ' &harr; ' + fs.target_file + ')' : '') +
-    '</span></div>' +
-    '<div style="color:var(--muted);font-size:13px;padding:20px 0">Results will appear here automatically when complete.</div>';
-}
+            last_mtime = pair["mtime"]
+            existing   = results_store.get(name)
+            prev_state = file_states.get(name, {})
 
-function renderDetail(r) {
-  document.getElementById('welcome').style.display = 'none';
-  const det = document.getElementById('detail');
-  det.style.display = 'block';
+            if not existing:
+                log_event(
+                    f"{name}: new file pair detected — "
+                    f"{pair['source_file']} + {pair['target_file']}",
+                    "info"
+                )
+            elif prev_state.get("_mtime") != last_mtime:
+                log_event(f"{name}: file change detected — re-validating", "info")
+            else:
+                continue  # unchanged
 
-  const pillCls = r.status==='PASS' ? 'pill-pass' : r.status==='ERROR' ? 'pill-err' : 'pill-fail';
-  const fs = allFileStates[r.name] || {};
+            file_states[name] = {
+                "state":       "validating",
+                "detected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "source_file": pair["source_file"],
+                "target_file": pair["target_file"],
+                "_mtime":      last_mtime,
+            }
 
-  let bannerHtml = '';
-  if (fs.state === 'changed')
-    bannerHtml = '<div class="state-banner changed">&#9888; File changed since last validation — results below may be outdated. Re-validation is queued.</div>';
+            try:
+                result = run_validation(name, pair["source_path"], pair["target_path"])
+                result["_mtime"] = last_mtime
+                results_store[name] = result
 
-  const dlBtn = r.excel_file
-    ? '<a class="dl-btn" href="/api/download/' + r.name + '" download="' + r.excel_file + '">&#8595; Excel Report</a>'
-    : '<span class="dl-btn disabled">&#8595; Excel Report</span>';
+                file_states[name] = {
+                    "state":        "done",
+                    "detected_at":  file_states[name]["detected_at"],
+                    "validated_at": result["run_at"],
+                    "source_file":  pair["source_file"],
+                    "target_file":  pair["target_file"],
+                    "_mtime":       last_mtime,
+                }
 
-  const errHtml = (r.errors && r.errors.length)
-    ? '<div class="error-box">&#10060; ' + r.errors.join('<br>') + '</div>' : '';
+                level = "success" if result["status"] == "PASS" else "warn"
+                log_event(
+                    f"{name}: validation complete — {result['status']} "
+                    f"({result['fields_passed']}/{result['total_fields']} fields passed, "
+                    f"{result['records_matched']:,} records matched)",
+                    level
+                )
 
-  const s = r.records_only_in_source, t = r.records_only_in_target;
-  const cardsHtml =
-    '<div class="cards">' +
-    card(fmt(r.total_source_records), 'Source Records', '') +
-    card(fmt(r.total_target_records), 'Target Records', '') +
-    card(fmt(r.records_matched),      'Keys Matched',   'ok') +
-    card(s, 'Source Only', s ? 'warn' : '') +
-    card(t, 'Target Only', t ? 'warn' : '') +
-    card(r.fields_passed, 'Fields Passed', 'ok') +
-    card(r.fields_failed, 'Fields Failed', r.fields_failed ? 'warn' : 'ok') +
-    card(r.pass_rate_pct + '%', 'Pass Rate', '') +
-    '</div>';
+            except Exception as e:
+                file_states[name]["state"] = "error"
+                log_event(f"{name}: validation error — {e}", "error")
 
-  let mapHtml = '';
-  if (r.mapping) {
-    const m = r.mapping;
-    const srcOnly = m.source_only_fields.length
-      ? m.source_only_fields.map(function(f){ return '<span class="map-tag warn">'+f+'</span>'; }).join('')
-      : '<span style="color:var(--muted);font-size:12px">none</span>';
-    const tgtOnly = m.target_only_fields.length
-      ? m.target_only_fields.map(function(f){ return '<span class="map-tag warn">'+f+'</span>'; }).join('')
-      : '<span style="color:var(--muted);font-size:12px">none</span>';
-    const nums = m.numeric_fields.length
-      ? m.numeric_fields.map(function(f){ return '<span class="map-tag numeric">'+f+' &plusmn;'+m.tolerance_map[f]+'</span>'; }).join('')
-      : '<span style="color:var(--muted);font-size:12px">none</span>';
-    mapHtml =
-      '<div class="section-title">Auto-Detected Mapping</div>' +
-      '<div class="mapping-grid">' +
-      '<div class="map-box"><h4>Join key</h4><span class="map-tag">' + m.join_key + '</span></div>' +
-      '<div class="map-box"><h4>Numeric fields (auto-tolerance)</h4>' + nums + '</div>' +
-      '<div class="map-box"><h4>Source-only columns (skipped)</h4>' + srcOnly + '</div>' +
-      '<div class="map-box"><h4>Target-only columns (skipped)</h4>' + tgtOnly + '</div>' +
-      '</div>';
-  }
+        scan_status["last_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-  const fieldRows = r.field_results.map(function(fr, i) {
-    const pct     = fr.match_pct;
-    const fillCls = pct >= 95 ? '' : pct >= 80 ? 'mid' : 'low';
-    const stBadge = fr.status === 'PASS'
-      ? '<span style="background:rgba(34,197,94,.15);color:var(--pass);font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px">PASS</span>'
-      : '<span style="background:rgba(239,68,68,.15);color:var(--fail);font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px">FAIL</span>';
-    const typeTag = fr.type === 'numeric'
-      ? '<span class="type-num">numeric<br><small>&plusmn;' + fr.tolerance + '</small></span>'
-      : '<span class="type-str">string</span>';
-    const hasMiss = fr.mismatches && fr.mismatches.length > 0;
-    const expIcon = hasMiss ? '<span class="expand-icon" id="ei-' + i + '">&blacktriangleright;</span> ' : '';
+    except Exception as e:
+        scan_status["error"] = str(e)
+        log_event(f"Scan error: {e}", "error")
+    finally:
+        scan_status["scanning"] = False
 
-    const missRows = hasMiss ? fr.mismatches.slice(0,20).map(function(m) {
-      return '<tr><td>' + m.material + '</td>' +
-             '<td class="diff-old">' + esc(String(m.source_value)) + '</td>' +
-             '<td class="diff-new">' + esc(String(m.target_value)) + '</td>' +
-             '<td style="color:var(--muted)">' + esc(m.issue) + '</td></tr>';
-    }).join('') : '';
 
-    const detailRow = hasMiss
-      ? '<tr class="mismatch-detail" id="md-' + i + '">' +
-        '<td colspan="7"><div class="mismatch-inner"><table>' +
-        '<thead><tr><th>Key</th><th>Source Value</th><th>Target Value</th><th>Issue</th></tr></thead>' +
-        '<tbody>' + missRows + '</tbody></table></div></td></tr>'
-      : '';
+def background_watcher(interval=5):
+    while True:
+        scan_and_validate_all()
+        time.sleep(interval)
 
-    return '<tr class="' + (hasMiss ? 'row-expander' : '') + '"' +
-           (hasMiss ? ' onclick="toggleRow(' + i + ')"' : '') + '>' +
-           '<td>' + expIcon + fr.field + '</td>' +
-           '<td>' + typeTag + '</td>' +
-           '<td>' + fr.total + '</td>' +
-           '<td>' + fr.matched + '</td>' +
-           '<td>' + (fr.mismatched + fr.miss_source + fr.miss_target) + '</td>' +
-           '<td><div class="pct-bar-wrap"><div class="pct-bar">' +
-           '<div class="pct-fill ' + fillCls + '" style="width:' + pct + '%"></div>' +
-           '</div><span class="pct-val">' + pct + '%</span></div></td>' +
-           '<td>' + stBadge + '</td></tr>' + detailRow;
-  }).join('');
 
-  det.innerHTML =
-    bannerHtml +
-    '<div class="detail-header">' +
-    '<div><div class="detail-title">' + r.name + '</div>' +
-    '<div class="detail-meta">' + r.source_file + ' &harr; ' + r.target_file +
-    ' &nbsp;&middot;&nbsp; Validated: ' + r.run_at + '</div></div>' +
-    '<div class="detail-actions">' + dlBtn +
-    '<span class="status-pill ' + pillCls + '">' + r.status + '</span></div></div>' +
-    errHtml + cardsHtml + mapHtml +
-    '<div class="section-title">Field-Level Results</div>' +
-    '<div class="tbl-wrap"><table><thead><tr>' +
-    '<th>Field</th><th>Type</th><th>Total</th><th>Matched</th>' +
-    '<th>Issues</th><th>Match %</th><th>Status</th>' +
-    '</tr></thead><tbody>' + fieldRows + '</tbody></table></div>';
-}
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.route("/")
+def index():
+    return render_template("dashboard.html")
 
-async function openLog() {
-  document.getElementById('log-modal').classList.add('open');
-  const activity = await fetch('/api/activity').then(r => r.json());
-  const el = document.getElementById('log-list');
-  if (!activity.length) { el.innerHTML = '<div class="empty-msg">No activity yet.</div>'; return; }
-  const LI = { info:'&#8505;', success:'&#10003;', warn:'&#9888;', error:'&#10060;' };
-  el.innerHTML = activity.map(function(e) {
-    return '<div class="log-entry ' + e.level + '">' +
-           '<span class="log-ts">' + e.ts + '</span>' +
-           '<span class="log-icon">' + (LI[e.level]||'') + '</span>' +
-           '<span class="log-msg">' + esc(e.message) + '</span></div>';
-  }).join('');
-}
-function closeLog() { document.getElementById('log-modal').classList.remove('open'); }
+@app.route("/api/scan", methods=["POST"])
+def api_scan():
+    threading.Thread(target=scan_and_validate_all, daemon=True).start()
+    return jsonify({"ok": True})
 
-async function openReports() {
-  document.getElementById('reports-modal').classList.add('open');
-  const list = document.getElementById('reports-list');
-  list.innerHTML = '<div class="empty-msg">Loading&hellip;</div>';
-  const reports = await fetch('/api/reports').then(r => r.json());
-  if (!reports.length) {
-    list.innerHTML = '<div class="empty-msg">No Excel reports yet.<br>Run a scan to generate them.</div>';
-    return;
-  }
-  list.innerHTML = reports.map(function(rep) {
-    return '<div class="report-row">' +
-           '<span class="report-name">&#128196; ' + rep.filename + '</span>' +
-           '<span class="report-meta">' + rep.size_kb + ' KB &nbsp; ' + rep.modified + '</span>' +
-           '<a class="report-dl" href="/api/download-file/' + encodeURIComponent(rep.filename) +
-           '" download="' + rep.filename + '">&#8595; Download</a></div>';
-  }).join('');
-}
-function closeReports() { document.getElementById('reports-modal').classList.remove('open'); }
+@app.route("/api/status")
+def api_status():
+    pairs = discover_pairs()
+    return jsonify({
+        "last_scan":    scan_status["last_scan"],
+        "scanning":     scan_status["scanning"],
+        "error":        scan_status["error"],
+        "source_dir":   str(SOURCE_DIR),
+        "target_dir":   str(TARGET_DIR),
+        "pairs":        pairs,
+        "file_states":  file_states,
+        "total_tables": len([p for p in pairs if p["has_pair"]]),
+        "unmatched":    len([p for p in pairs if not p["has_pair"]]),
+    })
 
-['log-modal','reports-modal'].forEach(function(id) {
-  document.getElementById(id).addEventListener('click', function(e) {
-    if (e.target === this) this.classList.remove('open');
-  });
-});
+@app.route("/api/results")
+def api_results():
+    return jsonify(list(results_store.values()))
 
-function toggleRow(i) {
-  const row  = document.getElementById('md-' + i);
-  const icon = document.getElementById('ei-' + i);
-  const open = row.style.display === 'table-row';
-  row.style.display = open ? 'none' : 'table-row';
-  icon.classList.toggle('open', !open);
-}
-function card(val, lbl, cls) {
-  return '<div class="card ' + cls + '"><div class="num">' + val +
-         '</div><div class="lbl">' + lbl + '</div></div>';
-}
-function fmt(n) { return Number(n).toLocaleString(); }
-function esc(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
+@app.route("/api/results/<name>")
+def api_result_detail(name):
+    result = results_store.get(name.upper())
+    if not result:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(result)
 
-init();
-</script>
-</body>
-</html>
+@app.route("/api/activity")
+def api_activity():
+    return jsonify(list(reversed(activity_log)))
+
+@app.route("/api/download/<name>")
+def api_download(name):
+    result = results_store.get(name.upper())
+    if not result:
+        return jsonify({"error": "Not found"}), 404
+    excel_file = result.get("excel_file")
+    if not excel_file:
+        return jsonify({"error": "No Excel report available"}), 404
+    path = REPORTS_DIR / excel_file
+    if not path.exists():
+        return jsonify({"error": "Report file missing — re-run scan"}), 404
+    return send_file(str(path), as_attachment=True, download_name=excel_file,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+@app.route("/api/download-file/<filename>")
+def api_download_file(filename):
+    path = REPORTS_DIR / filename
+    if not path.exists() or not filename.endswith(".xlsx"):
+        return jsonify({"error": "File not found"}), 404
+    return send_file(str(path), as_attachment=True, download_name=filename,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+@app.route("/api/reports")
+def api_reports():
+    files = sorted(REPORTS_DIR.glob("*.xlsx"), key=lambda f: f.stat().st_mtime, reverse=True)
+    return jsonify([
+        {"filename": f.name, "size_kb": round(f.stat().st_size / 1024, 1),
+         "modified": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")}
+        for f in files
+    ])
+
+@app.route("/api/folders")
+def api_folders():
+    return jsonify({
+        "source_dir":  str(SOURCE_DIR),
+        "target_dir":  str(TARGET_DIR),
+        "reports_dir": str(REPORTS_DIR),
+    })
+
+
+if __name__ == "__main__":
+    print(f"\n  SAP Post-Load Validator - Dashboard")
+    print(f"  Drop source files -> {SOURCE_DIR}")
+    print(f"  Drop target files -> {TARGET_DIR}")
+    print(f"  Excel reports     -> {REPORTS_DIR}")
+    print(f"  Open              -> http://localhost:5000\n")
+    threading.Thread(target=scan_and_validate_all, daemon=True).start()
+    threading.Thread(target=background_watcher, args=(5,), daemon=True).start()
+    app.run(debug=False, port=5000, use_reloader=False)
